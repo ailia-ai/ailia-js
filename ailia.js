@@ -125,7 +125,7 @@ export class Ailia {
      */
     static async initialize() {
         if (simd()){
-            const ModuleLoaded = await AiliaJsModule(Module);
+            const ModuleLoaded = await AiliaJsSimdModule(Module);
             await ModuleLoaded.ready;
         }else{
             const ModuleLoaded = await AiliaJsModule(Module);
