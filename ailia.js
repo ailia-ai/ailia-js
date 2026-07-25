@@ -139,12 +139,16 @@ export class Ailia {
      * Needs to be called to deallocate all WASM memory, once finished to use the Ailia model.
      */
     destroy() {
+        // shapeRef is allocated lazily by ensureShapeRefAllocation(), but
+        // blobCountRef and the blob buffers always exist, so they must be freed
+        // whether or not a shape was ever queried.
         if (this.shapeRef) {
             Module._free(this.shapeRef);
-            Module._free(this.blobCountRef);
-            this._destroyInputBuffers();
-            this._destroyOutputBuffers();
+            delete this.shapeRef;
         }
+        Module._free(this.blobCountRef);
+        this._destroyInputBuffers();
+        this._destroyOutputBuffers();
         Module.ccall('ailiaDestroy', null, ['number'], [this.ailiaDoublePointer.getPointer()]);
         this.ailiaDoublePointer.dispose();
     }
@@ -202,26 +206,30 @@ export class Ailia {
     }
 
     _destroyBuffers(buffersObject) {
-        if (buffersObject === null) {
+        if (!buffersObject || !Array.isArray(buffersObject.byIndex)) {
             return;
         }
 
-        if (Array.isArray(buffersObject?.byIndex)) {
-            for (const b of buffersObject.byIndex) { // b = {shape: Array<Int>, size: Int, buffer: AiliaBuffer, ...}
-                if (b.buffer) {
-                    Ailia.free(b.buffer);
-                }
+        for (const b of buffersObject.byIndex) { // b = {shape: Array<Int>, size: Int, buffer: AiliaBuffer, ...}
+            if (b.buffer) {
+                Ailia.free(b.buffer);
+                // Clear the reference: loadModel() and loadWeights() both
+                // destroy the buffers, so leaving it set would free it twice.
+                b.buffer = null;
             }
         }
-        buffersObject = null;
     }
 
     _destroyOutputBuffers() {
         this._destroyBuffers(this.outputBuffers);
+        // Drop the structure as well: the blob indices belong to the model that
+        // was loaded, so a subsequent load has to rebuild it.
+        this.outputBuffers = null;
     }
 
     _destroyInputBuffers() {
         this._destroyBuffers(this.inputBuffers);
+        this.inputBuffers = null;
     }
 
     _buildInputBuffersStructure() {
@@ -237,7 +245,7 @@ export class Ailia {
                 size: 0,
                 buffer: null,
                 inputIndex: i,
-                name: this.inputBuffers.byIndex[i],
+                name,
                 leavePreviousData: false
             };
             this.inputBuffers.byName[name] = this.inputBuffers.byIndex[i];
@@ -267,8 +275,10 @@ export class Ailia {
             if (shapes.length > this.inputBuffers.byIndex.length) {
                 throw new Error(`Error in _updateInputBuffers(): the shapes argument must contain at most as many elements as there are input buffers (${this.inputBuffers.byIndex.length})`);
             } else if (shapes.length < this.inputBuffers.byIndex.length) {
-                // complete with undefined elements,
-                // so that it will force to use previously any defined buffer or the model's initializer
+                // Complete with undefined elements, so that it will force to use
+                // any previously defined buffer or the model's initializer.
+                // Copy first: the caller's array must not be modified.
+                shapes = shapes.slice();
                 shapes[this.inputBuffers.byIndex.length - 1] = undefined;
             }
         }
@@ -278,7 +288,7 @@ export class Ailia {
             for (const b of this.inputBuffers.byIndex) {
                 b.shape = this._getBlobShape(b.blobIndex); // ShapeND array, size can also be > 4
                 b.size = Ailia._sizeOfShape(b.shape);
-                if (b.size > b.buffer.Float32.length) {
+                if (b.buffer === null || b.size > b.buffer.Float32.length) {
                     if (b.buffer) {
                         Ailia.free(b.buffer);
                     }
@@ -299,7 +309,7 @@ export class Ailia {
                 // Use the input shape defined in the model
                 b.shape = this._getBlobShape(b.blobIndex); // ShapeND array, size can also be > 4
                 b.size = Ailia._sizeOfShape(b.shape);
-                if (b.size > b.buffer.Float32.length) {
+                if (b.buffer === null || b.size > b.buffer.Float32.length) {
                     if (b.buffer) {
                         Ailia.free(b.buffer);
                     }
@@ -311,7 +321,7 @@ export class Ailia {
                 // update the shape in the model
                 b.size = Ailia._sizeOfShape(b.shape);
                 this._setInputBlobShape(b.blobIndex, b.shape);
-                if (b.size > b.buffer.Float32.length) {
+                if (b.buffer === null || b.size > b.buffer.Float32.length) {
                     if (b.buffer) {
                         Ailia.free(b.buffer);
                     }
@@ -327,7 +337,7 @@ export class Ailia {
         for (const b of this.outputBuffers.byIndex) {
             b.shape = this._getBlobShape(b.blobIndex); // ShapeND array, size can also be > 4
             b.size = Ailia._sizeOfShape(b.shape);
-            if (b.size > b.buffer.Float32.length) {
+            if (b.buffer === null || b.size > b.buffer.Float32.length) {
                 if (b.buffer) {
                     Ailia.free(b.buffer);
                 }
@@ -411,13 +421,16 @@ export class Ailia {
         }
         let blobNameLength = Module.HEAPU32[this.blobCountRef / 4];
 
+        let blobName = '';
         let nameBuffer = Ailia.allocateNew(blobNameLength);
         try {
             status = Module.ccall('ailiaFindBlobNameByIndex', 'number', ['number', 'number', 'number'], [this.ailiaDoublePointer.getPointer(), nameBuffer.byteOffset, blobNameLength, index]);
             if (status !== 0) {
                 console.error(`ailiaFindBlobNameByIndex error: ${status} (${this.getErrorDetail()})`);
             }
-            let blobName = nativeStringToJsString(nameBuffer.byteOffset);
+            // Pass the queried length: nativeStringToJsString() otherwise stops
+            // at its 30 character default and truncates longer blob names.
+            blobName = nativeStringToJsString(nameBuffer.byteOffset, blobNameLength);
         } finally {
             Ailia.free(nameBuffer);
         }
@@ -567,6 +580,7 @@ export class Ailia {
     _getBlobShape(blobIndex) {
         let rank = this._getBlobDim(blobIndex);
 
+        let returnedNDShape = [];
         let dimArray = Ailia.allocateNew(rank * SIZE_OF_U32);
         try {
 
@@ -580,7 +594,6 @@ export class Ailia {
                 throw e;
             }
 
-            let returnedNDShape = [];
             for (let i = 0; i < rank; i++) {
                 returnedNDShape.push(dimArray.Int32[i]);
             }
@@ -642,7 +655,7 @@ export class Ailia {
 
         if (typeof dataOrCallback === "function") {
             callback = dataOrCallback;
-        } else if (Array.isArray(data)) {
+        } else if (Array.isArray(dataOrCallback)) {
             data = dataOrCallback;
         } else {
             throw new Error("Error in run(): the dataOrCallback argument is not a function nor an array of arrays");
@@ -709,7 +722,7 @@ export class Ailia {
                     throw new Error(`Error in run(): the ${i}-th data element does not have the size deduced from the shapes argument`);
                 }
                 for (const [j, e] of d.entries()) {
-                    this.inputBuffers.byIndex[i].Float32[j] = e;
+                    this.inputBuffers.byIndex[i].buffer.Float32[j] = e;
                 }
             }
         }
@@ -737,10 +750,13 @@ export class Ailia {
         let result;
 
         if (postprocessingCallback === null) {
-            for (const [i, output] of this.outputBuffers.byIndex.entries()) {
+            result = [];
+            for (const output of this.outputBuffers.byIndex) {
                 let outputArray = new Array(output.size);
-                for (const [j, e] of output.buffer.Float32.entries()) {
-                    outputArray[j] = e;
+                // Buffers are only ever grown, so Float32 can be longer than
+                // the blob: copy exactly the blob's own element count.
+                for (let j = 0; j < output.size; j++) {
+                    outputArray[j] = output.buffer.Float32[j];
                 }
                 result.push(outputArray);
             }
@@ -755,9 +771,12 @@ export class Ailia {
     // -- Memory management methods
 
     static free(ailiaBuffer) {
+        // Read the offset before marking the buffer freed: the byteOffset
+        // getter throws once the buffer is marked.
+        const byteOffset = ailiaBuffer._isFreeable ? ailiaBuffer.byteOffset : 0;
         ailiaBuffer._markFreed();
         if (ailiaBuffer._isFreeable) {
-            Module._free(ailiaBuffer.byteOffset);
+            Module._free(byteOffset);
         }
     }
 
@@ -874,7 +893,8 @@ export class Ailia {
             } catch (e) {
                 console.error(`Call to ailiaSetInputBlobShapeND failed`);
                 console.error(this.getErrorDetail());
-                Ailia.free(dimArray);
+                // No free here: the finally block below already does it, and
+                // freeing twice throws over the real error.
                 throw e;
             }
         } finally {
@@ -1201,15 +1221,20 @@ class AiliaBuffer extends DataView {
     }
 
     static _createArrayProperty(name, typeSize) {
+        AiliaBuffer._arrayPropertyNames.push(name);
+
         Object.defineProperty(AiliaBuffer.prototype, name, {
             get: function() {
                 this._checkIsFreed();
 
+                // Read _view first: it drops the cached typed arrays if the
+                // WASM heap has grown since they were built.
+                const view = this._view;
                 const backingPropertyName = `_${name}`;
                 let array = this[backingPropertyName];
 
                 if (!array) {
-                    array = new globalThis[`${name}Array`](this._view.buffer, this._view.byteOffset, this.byteLength / typeSize);
+                    array = new globalThis[`${name}Array`](view.buffer, view.byteOffset, this.byteLength / typeSize);
                     this[backingPropertyName] = array;
                 }
 
@@ -1263,23 +1288,52 @@ class AiliaBuffer extends DataView {
         });
 
         Object.defineProperty(AiliaBuffer.prototype, 'byteOffset', {
-            get: function () { this._checkIsFreed(); return this._view.byteOffset; },
+            get: function () { this._checkIsFreed(); return this._byteOffset; },
             enumerable: true
         });
 
         Object.defineProperty(AiliaBuffer.prototype, 'byteLength', {
-            get: function () { this._checkIsFreed(); return this._view.byteLength; },
+            get: function () { this._checkIsFreed(); return this._byteLength; },
             enumerable: true
         });
     }
 
     static emptyBuffer = new ArrayBuffer(0);
 
+    // Filled in by _createArrayProperty(), so that a heap growth can invalidate
+    // every cached typed array.
+    static _arrayPropertyNames = [];
+
     constructor(buffer, byteOffset, byteLength, isFreeable) {
         super(AiliaBuffer.emptyBuffer, 0, 0);
         this._isFreed = false;
         this._isFreeable = isFreeable;
-        this._view = new DataView(buffer, byteOffset, byteLength);
+        this._byteOffset = byteOffset;
+        this._byteLength = byteLength;
+        this._heapBuffer = null;
+        this._dataView = null;
+    }
+
+    /*
+        Emscripten replaces Module.HEAP8.buffer with a larger ArrayBuffer when
+        the WASM heap grows, which detaches every view built over the previous
+        one. Keeping a DataView from construction time therefore breaks as soon
+        as a model or a blob buffer pushes the heap past its current size, so
+        rebuild against the live heap on demand instead.
+    */
+    get _view() {
+        const heapBuffer = Module.HEAP8.buffer;
+
+        if (this._heapBuffer !== heapBuffer) {
+            this._heapBuffer = heapBuffer;
+            this._dataView = new DataView(heapBuffer, this._byteOffset, this._byteLength);
+
+            for (const name of AiliaBuffer._arrayPropertyNames) {
+                this[`_${name}`] = null;
+            }
+        }
+
+        return this._dataView;
     }
 
     _markFreed() {
