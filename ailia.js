@@ -1,9 +1,29 @@
 import AiliaJsModule from './ailia_s.js';
 import AiliaJsSimdModule from './ailia_simd_s.js';
+import AiliaJsSimdThreadModule from './ailia_simd_thread_s.js';
 
 function simd(){
     const buf = new Uint8Array([0,97,115,109,1,0,0,0,1,6,1,96,1,123,1,123,3,2,1,0,10,10,1,8,0,32,0,32,0,253,44,11]);
     return WebAssembly.validate(buf);
+}
+
+function thread() {
+    // The multithreaded build uses SharedArrayBuffer, which browsers only expose to
+    // cross-origin isolated pages. Loading it without isolation leaves the
+    // initialization promise pending forever (the failure surfaces as a DataCloneError
+    // inside the worker setup, which cannot be caught by the caller), so support has to
+    // be decided up front rather than by trying and falling back on error.
+    if (typeof SharedArrayBuffer === 'undefined') {
+        return false;
+    }
+    if (typeof globalThis.crossOriginIsolated === 'boolean') {
+        // Browsers. The server delivering the page must send:
+        //     Cross-Origin-Opener-Policy: same-origin
+        //     Cross-Origin-Embedder-Policy: require-corp
+        return globalThis.crossOriginIsolated;
+    }
+    // Runtimes with no notion of cross-origin isolation, such as Node.
+    return true;
 }
 
 function isNodeRuntime() {
@@ -120,17 +140,33 @@ export class Ailia {
     static isInitialized = false;
 
     /**
+     * Name of the WASM variant selected by initialize().
+     * One of 'ailia_simd_thread_s', 'ailia_simd_s' or 'ailia_s'.
+     * Null until initialize() has been called.
+     */
+    static variant = null;
+
+    /**
      * Initialization of the Ailia WASM module.
      * This must be called exactly once, before creating any Ailia instance.
+     *
+     * The fastest variant supported by the current environment is selected.
+     * Multithreading additionally requires the page to be cross-origin isolated,
+     * see thread() above.
      */
     static async initialize() {
-        if (simd()){
-            const ModuleLoaded = await AiliaJsSimdModule(Module);
-            await ModuleLoaded.ready;
-        }else{
-            const ModuleLoaded = await AiliaJsModule(Module);
-            await ModuleLoaded.ready;
+        let ModuleLoaded;
+        if (simd() && thread()) {
+            Ailia.variant = 'ailia_simd_thread_s';
+            ModuleLoaded = await AiliaJsSimdThreadModule(Module);
+        } else if (simd()) {
+            Ailia.variant = 'ailia_simd_s';
+            ModuleLoaded = await AiliaJsSimdModule(Module);
+        } else {
+            Ailia.variant = 'ailia_s';
+            ModuleLoaded = await AiliaJsModule(Module);
         }
+        await ModuleLoaded.ready;
         Ailia.isInitialized = true;
     }
 
