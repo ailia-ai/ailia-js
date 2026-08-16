@@ -1029,13 +1029,15 @@ export class AiliaDetector {
         // Pre-allocate all memory need.
         this.objectCountRef = Module._malloc(SIZE_OF_POINTER); // unsigned int
 
-        const inputBufferSize = this.requiredInputWidth * this.requiredInputWidth * 4;
+        const inputBufferSize = this.requiredInputWidth * this.requiredInputHeight * 4;
         this.inputImageBuffer = Module._malloc(inputBufferSize);
 
         this.objectRef = Module._malloc(4 * 6); // aggregate of 6 numbers
     }
 
     dispose() {
+        // Release the native detector before the memory holding its handle.
+        Module.ccall('ailiaDestroyDetector', null, ['number'], [Module.HEAP32[this.detectorRef / 4]]);
         Module._free(this.objectCountRef);
         Module._free(this.inputImageBuffer);
         Module._free(this.objectRef);
@@ -1098,7 +1100,7 @@ export class AiliaDetector {
             Module.HEAPU8[this.inputImageBuffer + i + 3] = imageData.data[i + 3];
         }
 
-        return inputImageBuffer;
+        return this.inputImageBuffer;
     }
 
     _loadImageDataFromCanvas(sourceCanvas) {
