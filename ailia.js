@@ -305,7 +305,7 @@ export class Ailia {
     // If shapes != [], and if there are undefined elements in this array, the corresponding
     // inputs use the default initializer or the preexisting buffers, and if there are
     // some shapes of length 0 in this array, the corresponding inputs use the default inputs shapes of
-    // the mdoel.
+    // the model.
     _updateInputBuffers(shapes=[]) { // shapes: array<int>, can be of length>4
         if (shapes.length !== 0) {
             if (shapes.length > this.inputBuffers.byIndex.length) {
@@ -435,7 +435,7 @@ export class Ailia {
     /**
      * Loads both an ONNX model file and the associated weights file, for the Ailia instance.
      * @param {File} model The model file (often named with an extension ".onnx.prototxt")
-     * @param {File} weights The weights file (often named with an extention ".onnx")
+     * @param {File} weights The weights file (often named with an extension ".onnx")
      */
     loadModelAndWeights(model, weights) {
 
@@ -704,7 +704,12 @@ export class Ailia {
                 shapes = [];
             } else {
 
-                if (data[0].constructor.name === "Tensor") {
+                // A null or undefined element means "keep the previous buffer", and it is
+                // allowed anywhere including the first position, so look at the first
+                // element that is actually present to decide how the data is given.
+                const firstGiven = data.find((d) => d !== undefined && d !== null);
+
+                if (firstGiven && firstGiven.constructor.name === "Tensor") {
                     preparedBuffers = [];
                     // ignore shapes argument, if shapes argument not empty, error
                     if (shapes.length > 0) {
@@ -712,6 +717,9 @@ export class Ailia {
                     }
                     // attach the tensor buffers to this.inputBuffers
                     for (const t of data) {
+                        if (t === undefined || t === null) {
+                            continue;
+                        }
                         // TODO
                         //shapes.push(t.shape);
                         //preparedBuffers.push(t.buffer);
@@ -753,6 +761,11 @@ export class Ailia {
 
                 if (Array.isArray(d) === false) {
                     throw new Error("Error in run(): the data argument is not an array of tensors or an array of arrays");
+                }
+                // shapes[i] を省くと「前回のバッファを使う」扱いになり、初回はバッファが
+                // 用意されない。データを渡したい場合は shapes[i] の指定が要る。
+                if (this.inputBuffers.byIndex[i].buffer === null) {
+                    throw new Error(`Error in run(): the ${i}-th data element was given but has no buffer; give its shape through the shapes argument`);
                 }
                 if (d.length !== this.inputBuffers.byIndex[i].size) {
                     throw new Error(`Error in run(): the ${i}-th data element does not have the size deduced from the shapes argument`);
@@ -1132,13 +1145,8 @@ export class AiliaDetector {
 
     _ailiaDetectorGetObjectCount() {
         this._call('ailiaDetectorGetObjectCount', 'number', [Module.HEAP32[this.detectorRef / 4], this.objectCountRef]);
-        const objectCount = Module.HEAPU32[this.objectCountRef / 4];
-
-        if (objectCount < 0) {
-            this._throwAiliaError('ailiaDetectorGetObjectCount', `Unexpected detected object count (${objectCount})`, null);
-        }
-
-        return objectCount;
+        // ailiaDetectorGetObjectCount() writes an unsigned count, so it is read as such.
+        return Module.HEAPU32[this.objectCountRef / 4];
     }
 
     _ailiaDetectorGetObjects(minProbability) {
