@@ -1,24 +1,31 @@
 import AiliaJsModule from './ailia_s.js';
 import AiliaJsSimdModule from './ailia_simd_s.js';
+import AiliaJsSimdThreadModule from './ailia_simd_thread_s.js';
 
 function simd(){
     const buf = new Uint8Array([0,97,115,109,1,0,0,0,1,6,1,96,1,123,1,123,3,2,1,0,10,10,1,8,0,32,0,32,0,253,44,11]);
     return WebAssembly.validate(buf);
 }
 
-function isNodeRuntime() {
-    // Note that here
-    //    typeof navigator === 'undefined'
-    // and
-    //    navigator === undefined
-    // are not the same. On Node runtime, the former will run whereas the latter will throw.
-    return Boolean(typeof navigator === 'undefined');
+function thread() {
+    // The multithreaded build uses SharedArrayBuffer, which browsers only expose to
+    // cross-origin isolated pages. Loading it without isolation leaves the
+    // initialization promise pending forever (the failure surfaces as a DataCloneError
+    // inside the worker setup, which cannot be caught by the caller), so support has to
+    // be decided up front rather than by trying and falling back on error.
+    if (typeof SharedArrayBuffer === 'undefined') {
+        return false;
+    }
+    if (typeof globalThis.crossOriginIsolated === 'boolean') {
+        // Browsers. The server delivering the page must send:
+        //     Cross-Origin-Opener-Policy: same-origin
+        //     Cross-Origin-Embedder-Policy: require-corp
+        return globalThis.crossOriginIsolated;
+    }
+    // Runtimes with no notion of cross-origin isolation, such as Node.
+    return true;
 }
 
-let os;
-if (isNodeRuntime()) {
-    os = await import('os');
-}
 export const Module = {};
 
 // AILIA class interface
@@ -81,6 +88,11 @@ const SIZE_OF_POINTER = 4; // Need to change to 8 when (if) WASM become 64 bits.
 const SIZE_OF_AILIA_SHAPE = 5;
 const AILIA_SHAPE_VERSION = 1;
 
+/** Let ailia decide the number of threads to use. */
+export const AILIA_MULTITHREAD_AUTO = 0;
+/** Let ailia decide the environment to run the inference on. */
+export const AILIA_ENVIRONMENT_ID_AUTO = -1;
+
 class AiliaShape {
     constructor(...dims) {
         this.dims = dims.filter(dim => Boolean(dim));
@@ -98,17 +110,23 @@ export class Ailia {
 
     /**
      * Create an instance of Ailia.
+     *
+     * @param {number} [numThread=AILIA_MULTITHREAD_AUTO] Number of threads to use
+     *     for the inference. AILIA_MULTITHREAD_AUTO (0) lets ailia decide.
      */
-    constructor() {
+    constructor(numThread = AILIA_MULTITHREAD_AUTO) {
         if (Ailia.isInitialized === false) {
             throw new Error('Ailia has not yet been initialized.');
         }
 
+        if (!Number.isInteger(numThread) || numThread < 0) {
+            throw new Error(`numThread must be a non negative integer, got ${numThread}.`);
+        }
+
         this.Module = Module;
         this.ailiaDoublePointer = new DoublePointer(Module);
-        const envid = -1; // auto
-        const multhread = isNodeRuntime() ? os.cpus().length : navigator.hardwareConcurrency;
-        const status = Module.ccall('ailiaCreate', 'number', ['number', 'number', 'number'], [this.ailiaDoublePointer.getDoublePointer(), envid, multhread]);
+        const envid = AILIA_ENVIRONMENT_ID_AUTO;
+        const status = Module.ccall('ailiaCreate', 'number', ['number', 'number', 'number'], [this.ailiaDoublePointer.getDoublePointer(), envid, numThread]);
         if (status !== 0) {
             throw new Error(`Could not create the Ailia instance. Error status: ${status}`);
         }
@@ -120,17 +138,33 @@ export class Ailia {
     static isInitialized = false;
 
     /**
+     * Name of the WASM variant selected by initialize().
+     * One of 'ailia_simd_thread_s', 'ailia_simd_s' or 'ailia_s'.
+     * Null until initialize() has been called.
+     */
+    static variant = null;
+
+    /**
      * Initialization of the Ailia WASM module.
      * This must be called exactly once, before creating any Ailia instance.
+     *
+     * The fastest variant supported by the current environment is selected.
+     * Multithreading additionally requires the page to be cross-origin isolated,
+     * see thread() above.
      */
     static async initialize() {
-        if (simd()){
-            const ModuleLoaded = await AiliaJsSimdModule(Module);
-            await ModuleLoaded.ready;
-        }else{
-            const ModuleLoaded = await AiliaJsModule(Module);
-            await ModuleLoaded.ready;
+        let ModuleLoaded;
+        if (simd() && thread()) {
+            Ailia.variant = 'ailia_simd_thread_s';
+            ModuleLoaded = await AiliaJsSimdThreadModule(Module);
+        } else if (simd()) {
+            Ailia.variant = 'ailia_simd_s';
+            ModuleLoaded = await AiliaJsSimdModule(Module);
+        } else {
+            Ailia.variant = 'ailia_s';
+            ModuleLoaded = await AiliaJsModule(Module);
         }
+        await ModuleLoaded.ready;
         Ailia.isInitialized = true;
     }
 
@@ -269,7 +303,7 @@ export class Ailia {
     // If shapes != [], and if there are undefined elements in this array, the corresponding
     // inputs use the default initializer or the preexisting buffers, and if there are
     // some shapes of length 0 in this array, the corresponding inputs use the default inputs shapes of
-    // the mdoel.
+    // the model.
     _updateInputBuffers(shapes=[]) { // shapes: array<int>, can be of length>4
         if (shapes.length !== 0) {
             if (shapes.length > this.inputBuffers.byIndex.length) {
@@ -399,7 +433,7 @@ export class Ailia {
     /**
      * Loads both an ONNX model file and the associated weights file, for the Ailia instance.
      * @param {File} model The model file (often named with an extension ".onnx.prototxt")
-     * @param {File} weights The weights file (often named with an extention ".onnx")
+     * @param {File} weights The weights file (often named with an extension ".onnx")
      */
     loadModelAndWeights(model, weights) {
 
@@ -668,7 +702,12 @@ export class Ailia {
                 shapes = [];
             } else {
 
-                if (data[0].constructor.name === "Tensor") {
+                // A null or undefined element means "keep the previous buffer", and it is
+                // allowed anywhere including the first position, so look at the first
+                // element that is actually present to decide how the data is given.
+                const firstGiven = data.find((d) => d !== undefined && d !== null);
+
+                if (firstGiven && firstGiven.constructor.name === "Tensor") {
                     preparedBuffers = [];
                     // ignore shapes argument, if shapes argument not empty, error
                     if (shapes.length > 0) {
@@ -676,6 +715,9 @@ export class Ailia {
                     }
                     // attach the tensor buffers to this.inputBuffers
                     for (const t of data) {
+                        if (t === undefined || t === null) {
+                            continue;
+                        }
                         // TODO
                         //shapes.push(t.shape);
                         //preparedBuffers.push(t.buffer);
@@ -717,6 +759,11 @@ export class Ailia {
 
                 if (Array.isArray(d) === false) {
                     throw new Error("Error in run(): the data argument is not an array of tensors or an array of arrays");
+                }
+                // shapes[i] を省くと「前回のバッファを使う」扱いになり、初回はバッファが
+                // 用意されない。データを渡したい場合は shapes[i] の指定が要る。
+                if (this.inputBuffers.byIndex[i].buffer === null) {
+                    throw new Error(`Error in run(): the ${i}-th data element was given but has no buffer; give its shape through the shapes argument`);
                 }
                 if (d.length !== this.inputBuffers.byIndex[i].size) {
                     throw new Error(`Error in run(): the ${i}-th data element does not have the size deduced from the shapes argument`);
@@ -993,13 +1040,15 @@ export class AiliaDetector {
         // Pre-allocate all memory need.
         this.objectCountRef = Module._malloc(SIZE_OF_POINTER); // unsigned int
 
-        const inputBufferSize = this.requiredInputWidth * this.requiredInputWidth * 4;
+        const inputBufferSize = this.requiredInputWidth * this.requiredInputHeight * 4;
         this.inputImageBuffer = Module._malloc(inputBufferSize);
 
         this.objectRef = Module._malloc(4 * 6); // aggregate of 6 numbers
     }
 
     dispose() {
+        // Release the native detector before the memory holding its handle.
+        Module.ccall('ailiaDestroyDetector', null, ['number'], [Module.HEAP32[this.detectorRef / 4]]);
         Module._free(this.objectCountRef);
         Module._free(this.inputImageBuffer);
         Module._free(this.objectRef);
@@ -1062,7 +1111,7 @@ export class AiliaDetector {
             Module.HEAPU8[this.inputImageBuffer + i + 3] = imageData.data[i + 3];
         }
 
-        return inputImageBuffer;
+        return this.inputImageBuffer;
     }
 
     _loadImageDataFromCanvas(sourceCanvas) {
@@ -1094,13 +1143,8 @@ export class AiliaDetector {
 
     _ailiaDetectorGetObjectCount() {
         this._call('ailiaDetectorGetObjectCount', 'number', [Module.HEAP32[this.detectorRef / 4], this.objectCountRef]);
-        const objectCount = Module.HEAPU32[this.objectCountRef / 4];
-
-        if (objectCount < 0) {
-            this._throwAiliaError('ailiaDetectorGetObjectCount', `Unexpected detected object count (${objectCount})`, null);
-        }
-
-        return objectCount;
+        // ailiaDetectorGetObjectCount() writes an unsigned count, so it is read as such.
+        return Module.HEAPU32[this.objectCountRef / 4];
     }
 
     _ailiaDetectorGetObjects(minProbability) {
