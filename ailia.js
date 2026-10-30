@@ -26,19 +26,6 @@ function thread() {
     return true;
 }
 
-function isNodeRuntime() {
-    // Note that here
-    //    typeof navigator === 'undefined'
-    // and
-    //    navigator === undefined
-    // are not the same. On Node runtime, the former will run whereas the latter will throw.
-    return Boolean(typeof navigator === 'undefined');
-}
-
-let os;
-if (isNodeRuntime()) {
-    os = await import('os');
-}
 export const Module = {};
 
 // AILIA class interface
@@ -101,6 +88,11 @@ const SIZE_OF_POINTER = 4; // Need to change to 8 when (if) WASM become 64 bits.
 const SIZE_OF_AILIA_SHAPE = 5;
 const AILIA_SHAPE_VERSION = 1;
 
+/** Let ailia decide the number of threads to use. */
+export const AILIA_MULTITHREAD_AUTO = 0;
+/** Let ailia decide the environment to run the inference on. */
+export const AILIA_ENVIRONMENT_ID_AUTO = -1;
+
 class AiliaShape {
     constructor(...dims) {
         this.dims = dims.filter(dim => Boolean(dim));
@@ -118,17 +110,23 @@ export class Ailia {
 
     /**
      * Create an instance of Ailia.
+     *
+     * @param {number} [numThread=AILIA_MULTITHREAD_AUTO] Number of threads to use
+     *     for the inference. AILIA_MULTITHREAD_AUTO (0) lets ailia decide.
      */
-    constructor() {
+    constructor(numThread = AILIA_MULTITHREAD_AUTO) {
         if (Ailia.isInitialized === false) {
             throw new Error('Ailia has not yet been initialized.');
         }
 
+        if (!Number.isInteger(numThread) || numThread < 0) {
+            throw new Error(`numThread must be a non negative integer, got ${numThread}.`);
+        }
+
         this.Module = Module;
         this.ailiaDoublePointer = new DoublePointer(Module);
-        const envid = -1; // auto
-        const multhread = isNodeRuntime() ? os.cpus().length : navigator.hardwareConcurrency;
-        const status = Module.ccall('ailiaCreate', 'number', ['number', 'number', 'number'], [this.ailiaDoublePointer.getDoublePointer(), envid, multhread]);
+        const envid = AILIA_ENVIRONMENT_ID_AUTO;
+        const status = Module.ccall('ailiaCreate', 'number', ['number', 'number', 'number'], [this.ailiaDoublePointer.getDoublePointer(), envid, numThread]);
         if (status !== 0) {
             throw new Error(`Could not create the Ailia instance. Error status: ${status}`);
         }
